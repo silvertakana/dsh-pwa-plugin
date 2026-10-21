@@ -208,6 +208,88 @@ test('the mobile composer fix ships inline, never as a cacheable <script src>', 
   );
 });
 
+test('index tap appends the keyboard resize token to the shell viewport meta', () => {
+  const { ctx, taps } = makeCtx();
+  apply(ctx);
+  // The shell's own tag (dsh-web-frontend/dist/index.html:5). The rewrite must
+  // leave the rest of the tag alone: a fresh viewport meta would change how the
+  // entire app lays out on a phone.
+  const html =
+    '<html><head><meta name="viewport" content="width=device-width, initial-scale=1" />' +
+    '<title>DeepSeek Harness</title></head><body><div id="root"></div></body></html>';
+  const out = taps[0](html);
+  assert.ok(
+    out.includes(
+      '<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />'
+    ),
+    'the token must join the existing content and keep the tag intact'
+  );
+  assert.ok(out.includes('<title>DeepSeek Harness</title>'), 'the rest of the head must survive the rewrite');
+  // Scoped to the tag: the inlined keyboard source names the token in its own
+  // comments, so a whole-document count would count documentation as markup.
+  const meta = /<meta\b[^>]*\bname="viewport"[^>]*>/.exec(out)?.[0] ?? '';
+  assert.equal((meta.match(/interactive-widget=/g) ?? []).length, 1, 'exactly one copy of the token in the tag');
+});
+
+test('the viewport rewrite is idempotent and never invents a viewport meta', () => {
+  const { ctx, taps } = makeCtx();
+  apply(ctx);
+  // A shell that already opted in, and one that has no viewport meta at all:
+  // neither may change at the hands of this tap.
+  const optedIn =
+    '<html><head><meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">' +
+    '</head><body></body></html>';
+  const kept = taps[0](optedIn);
+  const keptMeta = /<meta\b[^>]*\bname="viewport"[^>]*>/.exec(kept)?.[0] ?? '';
+  assert.equal((keptMeta.match(/interactive-widget=/g) ?? []).length, 1, 'an existing token must not be appended twice');
+  assert.ok(kept.includes('content="width=device-width, initial-scale=1, interactive-widget=resizes-content"'));
+
+  const bare = '<html><head><title>t</title></head><body></body></html>';
+  const untouched = taps[0](bare);
+  // The injected keyboard source discusses the token in its comments, so the
+  // head is the only place this can be judged.
+  const head = untouched.slice(0, untouched.indexOf('</head>'));
+  assert.equal(head.includes('interactive-widget'), false, 'no viewport meta means no keyboard token');
+  assert.equal(head.includes('name="viewport"'), false, 'the tap must not add a viewport meta');
+  assert.ok(untouched.startsWith('<html><head><title>t</title>'), 'the document must otherwise be unchanged');
+});
+
+test('index tap inlines the mobile keyboard fix verbatim, before </body>', () => {
+  const { ctx, taps } = makeCtx();
+  apply(ctx);
+  const out = taps[0]('<html><body><div id="root"></div></body></html>');
+  const source = readFileSync(join(root, 'src', 'mobile-keyboard.js'), 'utf-8');
+  assert.ok(out.includes(source), 'the keyboard source must be inlined verbatim');
+  assert.ok(
+    out.indexOf(source) < out.lastIndexOf('</body>'),
+    'the fix must land before </body> so it is installed with the app shell'
+  );
+  assert.ok(out.includes('__DSH_FORCE_MOBILE_KEYBOARD__'), 'the test seam must survive injection');
+  // The plugin's own service worker answers non-HTML GETs cache-first, so an
+  // external script would pin its first version and never receive a fix.
+  assert.ok(
+    !/<script[^>]+src=[^>]*mobile-keyboard/.test(out),
+    'the fix must be inlined; a <script src> would be served cache-first forever'
+  );
+});
+
+test('index tap inlines the hold-to-queue fix verbatim, before </body>', () => {
+  const { ctx, taps } = makeCtx();
+  apply(ctx);
+  const out = taps[0]('<html><body><div id="root"></div></body></html>');
+  const source = readFileSync(join(root, 'src', 'mobile-queue.js'), 'utf-8');
+  assert.ok(out.includes(source), 'the queue source must be inlined verbatim');
+  assert.ok(
+    out.indexOf(source) < out.lastIndexOf('</body>'),
+    'the fix must land before </body> so it is installed with the app shell'
+  );
+  assert.ok(out.includes('__DSH_FORCE_MOBILE_QUEUE__'), 'the test seam must survive injection');
+  assert.ok(
+    !/<script[^>]+src=[^>]*mobile-queue/.test(out),
+    'the fix must be inlined; a <script src> would be served cache-first forever'
+  );
+});
+
 test('the effect cleanup disposes every route and the tap (HMR unmount)', () => {
   const { ctx, routes, taps, cleanups } = makeCtx();
   apply(ctx);
@@ -406,11 +488,11 @@ test('auth-state normalises the authority exactly the way dsh does', async () =>
 
 // A request shaped the way the route handlers read one: method, headers and an
 // async-iterable body.
-function makeRequest({ method = 'GET', host = HOST, cookie, body } = {}) {
+function makeRequest({ method = 'GET', host = HOST, cookie, headers, body } = {}) {
   const chunks = body === undefined ? [] : [Buffer.from(JSON.stringify(body), 'utf8')];
   return {
     method,
-    headers: { host, ...(cookie === undefined ? {} : { cookie }) },
+    headers: { host, ...(cookie === undefined ? {} : { cookie }), ...(headers ?? {}) },
     async *[Symbol.asyncIterator]() {
       for (const chunk of chunks) yield chunk;
     },
@@ -456,6 +538,69 @@ function credentialsFile(secretText) {
     '',
   ].join('\n');
 }
+
+test('the device routes log what they decided, so a stuck phone is diagnosable', async () => {
+  const home = withTempHome();
+  try {
+    const secretText = randomBytes(32).toString('base64url');
+    writeFileSync(home.credentialsPath, credentialsFile(secretText));
+    const { ctx, routes, logs } = makeCtx();
+    apply(ctx);
+    const session = dshCookie(HOST, secretText, Date.now());
+    const cookie = `${session.name}=${session.value}`;
+
+    // A key this host never issued is the lockout case: the page can only say "no
+    // longer trusted", so the server line has to name the key that was refused.
+    const stranger = makeRes();
+    await routes.get('/dsh-pwa/device/claim').handler(
+      makeRequest({ method: 'POST', body: { key: 'a-key-this-host-never-issued' } }),
+      stranger
+    );
+    assert.equal(stranger.code, 401);
+    const refused = logs.warn.find((line) => line.includes('claim refused'));
+    assert.ok(refused, 'a refused claim must be logged, not only answered');
+    assert.match(refused, /claim refused: key not enrolled/);
+    assert.ok(
+      refused.includes(createHash('sha256').update('a-key-this-host-never-issued').digest('base64url').slice(0, 8)),
+      'the log must carry the key fingerprint so it can be matched to an enrollment'
+    );
+    assert.ok(refused.includes('devices=0'), 'the log must carry how many devices are on file');
+
+    const enroll = makeRes();
+    await routes.get('/dsh-pwa/device').handler(
+      makeRequest({ method: 'POST', cookie, body: { label: 'Android Chrome' } }),
+      enroll
+    );
+    assert.equal(enroll.code, 200);
+    const granted = JSON.parse(enroll.body);
+    assert.ok(
+      logs.info.some((line) => line.includes(`enrolled id=${granted.id}`) && line.includes('devices=1')),
+      'an enrollment must be logged with its id and the resulting count'
+    );
+
+    const claim = makeRes();
+    await routes.get('/dsh-pwa/device/claim').handler(makeRequest({ method: 'POST', body: { key: granted.key } }), claim);
+    assert.equal(claim.code, 204);
+    assert.ok(
+      logs.info.some((line) => line.includes(`claim accepted id=${granted.id}`)),
+      'a successful claim must be logged, or a working device looks like an unused one'
+    );
+
+    const probe = makeRes();
+    await routes.get('/dsh-pwa/auth-state').handler(
+      makeRequest({ cookie, headers: { 'x-dsh-pwa-probe': '1' } }),
+      probe
+    );
+    assert.equal(probe.code, 200);
+    const verdict = logs.info.find((line) => line.includes('auth-state'));
+    assert.ok(verdict, 'the auth probe verdict must be logged');
+    assert.match(verdict, /valid=true/);
+    assert.match(verdict, /canMint=true/);
+    assert.match(verdict, /devices=1/);
+  } finally {
+    home.restore();
+  }
+});
 
 test('the device routes refuse a caller with no session', async () => {
   const home = withTempHome();

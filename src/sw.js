@@ -130,9 +130,16 @@ const SIGN_IN_PAGE = `
       });
     }
 
-    // The code-rejected message is the more useful one, so it is never replaced.
-    function say(message) {
-      if (note && note.textContent === '') note.textContent = message;
+    // A verdict replaces the transient line, and a verdict already on the page is
+    // never replaced: that keeps the code-rejected message, which is the more useful
+    // one. The transient line has to be replaceable or a failed device check leaves
+    // the phone claiming it is still checking.
+    var TRANSIENT = 'Checking this device...';
+
+    function say(message, force) {
+      if (!note) return;
+      if (!force && note.textContent !== '' && note.textContent !== TRANSIENT) return;
+      note.textContent = message;
     }
 
     // A minted cookie is only worth having if the fence accepts it, so this asks
@@ -152,26 +159,40 @@ const SIGN_IN_PAGE = `
         .catch(function () { return false; });
     }
 
+    // The reason a claim failed is the whole diagnosis, and the two families need
+    // different fixes: a 401 means this host holds no record of the key the device is
+    // sending, while a mint the fence then refuses means the host's own cookie did not
+    // satisfy it. An empty string means the device is trusted again.
     function claim(key) {
       return fetch('/dsh-pwa/device/claim', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ key: key })
-      }).then(function (response) { return response.ok ? works() : false; });
+      }).then(function (response) {
+        if (!response.ok) return 'the host answered ' + response.status + ' for the key this device sent';
+        return works().then(function (valid) {
+          return valid ? '' : 'the host minted a cookie the fence refused';
+        });
+      }).catch(function () { return 'the claim request did not complete'; });
     }
 
-    // One line saying which of the three failures this is: no cookie, a cookie
-    // the fence refused, or a host that cannot mint one at all.
-    function describe() {
+    // One line saying which failure this is: no cookie, a cookie the fence refused, a
+    // host that cannot mint one at all, or a device key the host does not know. The
+    // reason travels in from the caller, because only it knows why the check ran.
+    function describe(reason) {
       return fetch('/dsh-pwa/auth-state', { headers: { 'x-dsh-pwa-probe': '1' }, cache: 'no-store' })
         .then(function (response) { return response.ok ? response.json() : null; })
         .then(function (state) {
-          if (!state || !deviceLine) return;
+          if (!deviceLine) return;
           var parts = [];
-          if (state.authority) parts.push('host ' + state.authority);
-          parts.push(state.cookiePresent ? 'a session cookie is present but was refused' : 'no session cookie on this device');
-          if (state.canMint === false) parts.push('this host cannot mint one');
+          if (state && state.authority) parts.push('host ' + state.authority);
+          if (state) {
+            parts.push(state.cookiePresent ? 'a session cookie is present but was refused' : 'no session cookie on this device');
+            if (state.canMint === false) parts.push('this host cannot mint one');
+            if (typeof state.deviceCount === 'number') parts.push(state.deviceCount + ' device(s) enrolled');
+          }
+          if (reason) parts.push(reason);
           deviceLine.textContent = 'Diagnosis: ' + parts.join(', ') + '.';
         })
         .catch(function () {});
@@ -181,19 +202,19 @@ const SIGN_IN_PAGE = `
       forget.addEventListener('click', function () {
         clearKey().then(function () {
           forget.hidden = true;
-          say('This device was forgotten. Sign in with a code.');
+          say('This device was forgotten. Sign in with a code.', true);
         });
       });
     }
 
     readKey().then(function (key) {
-      if (!key) { describe(); return; }
-      say('Checking this device...');
-      claim(key).then(function (ok) {
-        if (ok) { window.location.replace('/'); return; }
+      if (!key) { describe('no device key is stored on this browser'); return; }
+      say(TRANSIENT);
+      claim(key).then(function (failure) {
+        if (failure === '') { window.location.replace('/'); return; }
         forget.hidden = false;
-        say('This device is no longer trusted. Sign in with a code.');
-        describe();
+        say('This device is no longer trusted. Sign in with a code.', true);
+        describe(failure);
       });
     });
 

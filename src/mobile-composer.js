@@ -71,8 +71,14 @@
  *    On a desktop that is a nicety; on a phone the keyboard covers half the
  *    screen. So the keyboard is governed by the tap, not by the focus call: a
  *    programmatic focus of a composer that does not already have it is made
- *    quiet, a press anywhere else in the composer card puts an open keyboard
- *    away, and a press on the text area itself gives it back. See section 4.
+ *    quiet, a press on the text area itself gives it back, and only a press
+ *    that leaves the conversation - the session sidebar, the header's view
+ *    tabs, Settings - puts an open keyboard away. A press anywhere inside the
+ *    conversation keeps it, including Send: the app's height follows the
+ *    keyboard (src/mobile-keyboard.js and the shell's interactive-widget
+ *    token), so a press that closed it would move the composer out from under
+ *    the finger between pointerdown and click and Send would need a second
+ *    tap. See section 4.
  *
  * 1.1.5 removed the diagnostic probe buttons, the plain `field` comparison
  * editables and the trace panel the paste investigation used; they are in git
@@ -626,7 +632,8 @@
     // only lever left on an engine that ignores both attributes, and the guard
     // keeps it from closing a keyboard the user opened in the meantime.
     setTimeout(function () {
-      if (root.__dshPwaQuiet === true) dismissKeyboard(root);
+      var dismissed = root.__dshPwaQuiet === true;
+      if (dismissed) dismissKeyboard(root);
     }, 0);
   }
 
@@ -636,11 +643,15 @@
     HTMLElement.prototype.focus = function () {
       var root = composerElement(this);
       if (root === null) return nativeFocus.apply(this, arguments);
-      if (Date.now() < userIntentUntil) return nativeFocus.apply(this, arguments);
+      if (Date.now() < userIntentUntil) {
+        return nativeFocus.apply(this, arguments);
+      }
       // Already focused: Lexical re-focusing its own root while the user types
       // (client.js:7794), or a second pass over the composer they are in.
       // Closing that keyboard is the bug, so this one is left alone.
-      if (document.activeElement === root) return nativeFocus.apply(this, arguments);
+      if (document.activeElement === root) {
+        return nativeFocus.apply(this, arguments);
+      }
       return quietFocus(root, arguments);
     };
     return true;
@@ -681,11 +692,25 @@
           return;
         }
 
-        // Any other press in the composer - send, stop, the + menu, the model
-        // seat - is the user leaving the text. Put the keyboard away, and mark
-        // the composer quiet so the press's own keepDraftFocus cannot bring it
-        // back and a later tap on the text area knows to re-focus.
-        if (target.closest('[data-composer-card]') === null) return;
+        // A press inside the conversation - the transcript and its links, an
+        // attachment, the composer's own buttons - is part of the exchange the
+        // keyboard is open for, so it is left alone. Closing the keyboard there
+        // is what made Send need two taps: the app's height follows the keyboard
+        // (mobile-keyboard.js and the shell's interactive-widget token), so the
+        // composer slides down between pointerdown and click and the press lands
+        // somewhere else entirely.
+        if (target.closest('[data-conversation-region],[data-composer-card]') !== null) {
+          // A press here is the user asking for this conversation, which is also
+          // the answer for a focus the app issues in the same gesture: the
+          // re-focus after a submit, the caret a control puts back.
+          userIntentUntil = Date.now() + INTENT_MS;
+          return;
+        }
+
+        // What is left replaces the conversation rather than adding to it: the
+        // session sidebar, the header and its view tabs, Settings. The keyboard
+        // goes with them, and the composer is left quiet so a re-focus on the way
+        // back cannot raise it again.
         var editor = currentComposer();
         if (editor === null) return;
         quiet(editor);
@@ -693,6 +718,80 @@
       },
       true,
     );
+
+    // ---- 5. A press on a control inside the card keeps the caret ----
+    //
+    // Chromium focuses a button on press, and that default action blurs the
+    // draft, so the keyboard closes under a press the user made to stay in the
+    // exchange: the model chip, the permission chip, the microphone. The app
+    // cancels the press for the card's blank space (client.js:18925) and keeps
+    // the draft for Send (client.js:18386, 19129), and it leaves controls out
+    // of both on purpose; they are kept here. Only a caret that is already in
+    // the draft is kept, and a field inside the card still takes its own focus.
+    function keepDraftOnControl(event) {
+      if (event.defaultPrevented === true) return;
+      if (typeof event.button === 'number' && event.button !== 0) return;
+      var target = event.target;
+      if (!target || typeof target.closest !== 'function') return;
+      if (target.closest('[data-composer-card], [data-composer-seat], [data-composer-dock]') === null) return;
+      if (target.closest('input, textarea, select, [contenteditable]') !== null) return;
+      if (target.closest('[data-composer-overlay]') !== null) return;
+      // Whether the draft is reported as focused is recorded, not required: on
+      // Android the IME can hold a composer that document.activeElement no longer
+      // names, and a press is exactly when that is most likely to be true.
+      event.preventDefault();
+    }
+    document.addEventListener('mousedown', keepDraftOnControl, true);
+
+    // ---- 5b. A control that takes the focus anyway gives it back ----
+    //
+    // Cancelling the press is not enough on Android. A tap on the model chip
+    // shows a cancelled press, and eleven milliseconds later the draft blurs as
+    // the chip takes focus: the browser focuses the button once the press is
+    // over, and a focused button takes the keyboard with it. The menus the chips
+    // open do not take focus of their own (the chip keeps it for as long as the
+    // menu is up), so the caret can go straight back without closing anything.
+    var lastFocus = null;
+    function keepCaretFromControl(event) {
+      var target = event.target;
+      var previous = lastFocus;
+      lastFocus = target === null || target === undefined ? null : target;
+      if (target === null || target === undefined) return;
+      if (typeof target.closest !== 'function') return;
+      if (target.closest(EDITOR_SELECTOR) !== null) return;
+      // Only a caret that came from the draft: focus the user moved elsewhere is
+      // the app's business, and a field still takes its own press.
+      if (previous === null || typeof previous.closest !== 'function') return;
+      if (previous.closest(EDITOR_SELECTOR) === null) return;
+      if (target.closest('input, textarea, select, [contenteditable]') !== null) return;
+      if (target.closest('[data-composer-card], [data-composer-seat], [data-composer-dock]') === null) return;
+      // A menu or dialog rendered by the app owns its focus while it is open.
+      if (target.closest('[role="menu"], [role="listbox"], [role="dialog"], [role="combobox"]') !== null) return;
+      var root = liveEditor();
+      if (root === null) return;
+      userIntentUntil = Date.now() + INTENT_MS;
+      unquiet(root);
+      if (document.activeElement !== root) nativeFocus.call(root, { preventScroll: true });
+    }
+    document.addEventListener('focusin', keepCaretFromControl, true);
+
+    // ---- 6. The hold gesture's chord needs the caret ----
+    //
+    // mobile-queue.js submits through the app's own Cmd/Ctrl+Enter, which reads
+    // the draft and its selection (client.js:18246 and the submit path behind
+    // it). A press that moved focus leaves neither, so the hold asks for the
+    // caret back first. The request counts as the user's, so the keyboard
+    // follows it up instead of being muted the way a programmatic focus is.
+    if (typeof window !== 'undefined') {
+      window.__dshPwaKeepDraftFocus = function () {
+        var root = liveEditor();
+        if (root === null) return false;
+        userIntentUntil = Date.now() + INTENT_MS;
+        unquiet(root);
+        if (document.activeElement !== root) nativeFocus.call(root, { preventScroll: true });
+        return document.activeElement === root;
+      };
+    }
   }
 
 })();

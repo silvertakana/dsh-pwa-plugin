@@ -278,6 +278,12 @@ test('the sign-in page claims a remembered device before falling back to a code'
     !html.includes("fetch('/', { credentials"),
     'the cookie test must not read the cached shell: ask the host probe instead'
   );
+  // A refusal has to say why, and the transient line must never hide the verdict:
+  // that combination is what made a refused device look like a hung one.
+  assert.match(html, /the host answered/, 'the page must carry the host status into the diagnosis line');
+  assert.match(html, /the host minted a cookie the fence refused/, 'a mint the fence refuses must be named as such');
+  assert.match(html, /var TRANSIENT = 'Checking this device\.\.\.'/, 'the transient line is named so it can be replaced');
+  assert.match(html, /describe\(failure\)/, 'the claim failure must reach the diagnosis line');
 });
 
 test('a failing cache put never breaks the HTML response', async () => {
