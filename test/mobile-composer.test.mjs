@@ -883,12 +883,23 @@ test('the composer ships no diagnostic probe or trace panel', async () => {
 /** A press on a composer button that is not the text area (send, stop, +, model). */
 function composerButton() {
   const card = {};
-  return { closest: (selector) => (selector === '[data-composer-card]' ? card : null) };
+  return { closest: (selector) => (asks(selector, '[data-composer-card]') ? card : null) };
 }
 
-/** A press anywhere else in the app. */
+/** A press somewhere in the conversation: the transcript, a link, an attachment. */
+function chatTarget() {
+  const region = {};
+  return { closest: (selector) => (asks(selector, '[data-conversation-region]') ? region : null) };
+}
+
+/** A press on a surface that replaces the conversation: sidebar, header tabs, Settings. */
 function outsideTarget() {
   return { closest: () => null };
+}
+
+/** The handler asks for several selectors at once, so match one of them by name. */
+function asks(selector, name) {
+  return selector.split(',').some((part) => part.trim() === name);
 }
 
 function press(document, target) {
@@ -896,6 +907,29 @@ function press(document, target) {
   event.target = target;
   document.fire('pointerdown', event);
   return event;
+}
+
+/** The press that moves focus: mousedown, the default the app leaves to engines. */
+function clickDown(document, target) {
+  const event = new StubEvent('mousedown', { bubbles: true, cancelable: true });
+  event.target = target;
+  document.fire('mousedown', event);
+  return event;
+}
+
+/** A focus that landed on the given element, the way focusin reports it. */
+function focusEvent(target) {
+  const event = new StubEvent('focusin', { bubbles: true });
+  event.target = target;
+  return event;
+}
+
+/** A press on a field inside the card: an input, a textarea, a second editable. */
+function fieldTarget() {
+  const hit = {};
+  return {
+    closest: (selector) => (asks(selector, 'input') || asks(selector, '[data-composer-card]') ? hit : null),
+  };
 }
 
 test('a programmatic focus of a composer the user is not in never raises the keyboard', async () => {
@@ -955,7 +989,7 @@ test('a tap on the text area gives the keyboard back', async () => {
   assert.equal(document.activeElement, root);
 });
 
-test('a press on the send button puts an open keyboard away', async () => {
+test('a press on the send button leaves the keyboard where it is', async () => {
   const hides = [];
   const { document, root } = await load({ coarse: true, virtualKeyboard: { hide: () => hides.push('hide') } });
 
@@ -963,26 +997,34 @@ test('a press on the send button puts an open keyboard away', async () => {
   press(document, composerButton());
   await settle(2);
 
-  assert.deepEqual(hides, ['hide'], 'a send must close the keyboard, not leave it over the transcript');
-  assert.equal(
-    root.getAttribute('inputmode'),
-    'none',
-    'and the composer is left quiet, so the press cannot bring the keyboard back',
-  );
+  assert.deepEqual(hides, [], 'the keyboard stays up: closing it would move the button out from under the finger');
+  assert.equal(root.getAttribute('inputmode'), null, 'and nothing is quietened behind the press');
 });
 
-test('the focus the press itself performs cannot reopen the keyboard', async () => {
+test('the focus the press itself performs changes nothing while the editor is focused', async () => {
   const { document, root } = await load({ coarse: true });
 
   document.activeElement = root;
   press(document, composerButton());
   root.focus(); // what the button's own keepDraftFocus does on that same press
 
-  assert.equal(root.getAttribute('inputmode'), 'none');
+  assert.equal(root.getAttribute('inputmode'), null, 'a press must not silence a keyboard it is not closing');
   assert.equal(document.activeElement, root, 'and the caret stays in the editor');
 });
 
-test('a press outside the composer leaves the editor alone', async () => {
+test('a press on the transcript keeps the keyboard', async () => {
+  const hides = [];
+  const { document, root } = await load({ coarse: true, virtualKeyboard: { hide: () => hides.push('hide') } });
+
+  document.activeElement = root;
+  press(document, chatTarget());
+  await settle(2);
+
+  assert.deepEqual(hides, [], 'following a link or opening an attachment is not leaving the text');
+  assert.equal(root.getAttribute('inputmode'), null);
+});
+
+test('a press on the sidebar, the view tabs or Settings puts the keyboard away', async () => {
   const hides = [];
   const { document, root } = await load({ coarse: true, virtualKeyboard: { hide: () => hides.push('hide') } });
 
@@ -990,8 +1032,125 @@ test('a press outside the composer leaves the editor alone', async () => {
   press(document, outsideTarget());
   await settle(2);
 
-  assert.deepEqual(hides, [], 'a tap on the transcript or the sidebar is not a tap on the composer');
+  assert.deepEqual(hides, ['hide'], 'a surface that replaces the conversation takes the keyboard with it');
+  assert.equal(
+    root.getAttribute('inputmode'),
+    'none',
+    'and the composer is left quiet, so a re-focus on the way back cannot raise it again',
+  );
+});
+
+test('a press on a control in the card keeps the caret and the keyboard', async () => {
+  const hides = [];
+  const { document, root } = await load({ coarse: true, virtualKeyboard: { hide: () => hides.push('hide') } });
+
+  document.activeElement = root; // the user was typing
+  const event = clickDown(document, composerButton());
+  await settle(2);
+
+  assert.equal(
+    event.defaultPrevented,
+    true,
+    'the control must not take the focus the keyboard is open for',
+  );
+  assert.equal(document.activeElement, root, 'the caret stays in the draft');
+  assert.deepEqual(hides, [], 'and the keyboard never closes');
   assert.equal(root.getAttribute('inputmode'), null);
+});
+
+test('a control that takes the focus anyway gives the caret back', async () => {
+  const { document, root } = await load({ coarse: true });
+  const button = composerButton();
+  document.querySelectorAll = () => [root];
+
+  // The 1.4.9 trace: the press is cancelled, and the browser still focuses the
+  // chip a few milliseconds later - which on Android closes the keyboard.
+  document.activeElement = root;
+  document.fire('focusin', focusEvent(root));
+  document.activeElement = button;
+  document.fire('focusin', focusEvent(button));
+  await settle(2);
+
+  assert.equal(document.activeElement, root, 'the caret goes back to the draft');
+});
+
+test('a menu outside the card keeps the focus it takes', async () => {
+  const { document, root } = await load({ coarse: true });
+  const item = { closest: () => null };
+
+  document.activeElement = root;
+  document.fire('focusin', focusEvent(root));
+  document.activeElement = item;
+  document.fire('focusin', focusEvent(item));
+
+  assert.equal(document.activeElement, item, 'a surface outside the composer is left alone');
+});
+
+test('a control the user reaches while the caret is elsewhere is left alone', async () => {
+  const { document } = await load({ coarse: true });
+  const button = composerButton();
+  const elsewhere = { closest: () => null };
+
+  document.activeElement = elsewhere;
+  document.fire('focusin', focusEvent(elsewhere));
+  document.activeElement = button;
+  document.fire('focusin', focusEvent(button));
+  await settle(2);
+
+  assert.equal(document.activeElement, button, 'the caret was not in the draft, so nothing is taken back');
+});
+
+test('a field inside the card still takes its own press', async () => {
+  const { document, root } = await load({ coarse: true });
+
+  document.activeElement = root;
+  const event = clickDown(document, fieldTarget());
+
+  assert.equal(event.defaultPrevented, false, 'a filter box or the file input needs the press itself');
+});
+
+test('a control press is kept even when the draft is not reported as focused', async () => {
+  const { document } = await load({ coarse: true });
+
+  // Android can hold a composer that document.activeElement no longer names while
+  // the IME is still up, so the caret test would go dark exactly when it matters.
+  document.activeElement = null;
+  const event = clickDown(document, composerButton());
+
+  assert.equal(event.defaultPrevented, true, 'the press must not take focus from the composer');
+});
+
+test('a press in the conversation renews the user intent for the focus it causes', async () => {
+  const { document, root } = await load({ coarse: true });
+
+  press(document, chatTarget());
+  root.focus();
+  await settle(2);
+
+  assert.equal(
+    root.getAttribute('inputmode'),
+    null,
+    'a focus right after the user tapped the chat is theirs, not the app talking to itself',
+  );
+});
+
+test('the hold gesture can ask for the caret back without silencing the keyboard', async () => {
+  const { document, root, window, focusLog } = await load({ coarse: true });
+  const hook = window.__dshPwaKeepDraftFocus;
+  assert.equal(typeof hook, 'function', 'mobile-queue.js has to be able to call this');
+  // The editor the document holds, which is how the hook finds it without a
+  // focused element to start from.
+  document.querySelectorAll = () => [root];
+
+  // The press moved focus to the button before the chord could fire.
+  document.activeElement = null;
+  const kept = hook();
+  await settle(2);
+
+  assert.equal(kept, true, 'the caller learns whether the caret came back');
+  assert.equal(document.activeElement, root);
+  assert.equal(root.getAttribute('inputmode'), null, 'the keyboard follows the caret back up');
+  assert.equal(focusLog.length, 1);
 });
 
 test('a fine pointer gets none of this', async () => {

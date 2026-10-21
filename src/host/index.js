@@ -201,13 +201,49 @@ export function apply(ctx) {
     });
 
     // 4. Inject SW registration + the client-side fixes into index.html.
-    //    Both fixes are inlined rather than served as a <script src>: the service
+    //    The fixes are inlined rather than served as a <script src>: the service
     //    worker answers non-HTML GETs cache-first, so an external file would pin
     //    its first version forever.
     const clientFixPaths = [
       join(__dirname, '..', 'mobile-composer.js'),
+      join(__dirname, '..', 'mobile-keyboard.js'),
+      join(__dirname, '..', 'mobile-queue.js'),
       join(__dirname, '..', 'pwa-client.js')
     ];
+    // 4a. Ask the browser to shrink the layout viewport when the soft keyboard
+    //     opens, by appending to the shell's own viewport meta:
+    //
+    //       <meta name="viewport" content="width=device-width, initial-scale=1" />
+    //
+    //     Chromium resizes only the visual viewport by default (since Chrome 108),
+    //     so a `height:100%` column keeps its full height behind the keyboard and
+    //     the composer is laid out under it. `interactive-widget=resizes-content`
+    //     is the opt-in that restores the resize: where it is honoured the app is
+    //     the right height with no script at all. Safari ignores it (WebKit has it
+    //     implemented but unshipped), which is why mobile-keyboard.js measures
+    //     visualViewport as well; with the resize in effect that measurement reads
+    //     a gap of 0 and does nothing, so the two paths cannot double up.
+    //
+    //     The tag is only rewritten when the shell already ships one with a
+    //     `content` attribute. Adding a viewport meta to a document that has none
+    //     would change how the whole app lays out on a phone, which is not this
+    //     plugin's call to make; a rewrite of the existing value changes only the
+    //     keyboard behaviour.
+    const VIEWPORT_META = /<meta\b[^>]*\bname\s*=\s*["']viewport["'][^>]*>/i;
+    const CONTENT_ATTR = /\bcontent\s*=\s*(["'])([\s\S]*?)\1/i;
+    const keyboardResizeViewport = (html) => {
+      const meta = VIEWPORT_META.exec(html);
+      if (meta === null) return html;
+      const tag = meta[0];
+      const content = CONTENT_ATTR.exec(tag);
+      if (content === null) return html;
+      if (/\binteractive-widget\s*=/i.test(content[2])) return html;
+      const patched = tag.replace(
+        content[0],
+        `content=${content[1]}${content[2]}, interactive-widget=resizes-content${content[1]}`
+      );
+      return html.slice(0, meta.index) + patched + html.slice(meta.index + tag.length);
+    };
     const disposeTap = webServer.tapIndex((html) => {
       const script = `<script>
 (function() {
@@ -264,7 +300,7 @@ ${source}
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="DSH">`;
-      let out = html;
+      let out = keyboardResizeViewport(html);
       const headEnd = out.indexOf('</head>');
       // Without a </head> the tags ride along with the scripts rather than
       // preempting the document, so a partial fragment keeps its own prefix.
@@ -323,6 +359,15 @@ ${source}
             if (at === -1 || segment.slice(0, at).trim() !== name) continue;
             length = segment.slice(at + 1).trim().length;
           }
+          const canMint = loadSecret(credentialsPath) !== undefined;
+          const deviceCount = loadDevices(devicesPath).devices.length;
+          const valid = authenticated(req);
+          // Logged because this verdict otherwise exists only on the phone's own
+          // screen, and a phone cannot be asked to open a console: when it reports
+          // a lockout, this is the line that says which half failed.
+          ctx.logger.info(
+            `[DSH PWA] auth-state host=${authority ?? 'unknown'} cookie=${length > 0 ? `present (${length} chars)` : 'absent'} valid=${valid} canMint=${canMint} devices=${deviceCount}`
+          );
           res.writeHead(200, headers);
           res.end(JSON.stringify({
             authority: authority ?? null,
@@ -332,9 +377,9 @@ ${source}
             // The sign-in page needs the fence's own verdict, not a guess: the app
             // shell is cached, so fetching '/' to test a cookie can be answered
             // from the cache and report success for a cookie the fence rejects.
-            cookieValid: authenticated(req),
-            canMint: loadSecret(credentialsPath) !== undefined,
-            deviceCount: loadDevices(devicesPath).devices.length
+            cookieValid: valid,
+            canMint,
+            deviceCount
           }));
         } catch (err) {
           ctx.logger.warn(`[DSH PWA] auth-state: ${err.message}`);
@@ -402,12 +447,15 @@ ${source}
             : 'Device';
           const key = newDeviceKey();
           const id = randomBytes(8).toString('hex');
-          saveDevices(devicesPath, addDevice(loadDevices(devicesPath), {
-            id,
-            label,
-            keyHash: hashKey(key),
-            now: Date.now()
-          }));
+          const before = loadDevices(devicesPath);
+          const after = addDevice(before, { id, label, keyHash: hashKey(key), now: Date.now() });
+          saveDevices(devicesPath, after);
+          // A full list drops its oldest entry, which is how a phone that keeps
+          // re-enrolling silently loses the record it is still holding. Say so.
+          const evicted = before.devices.find((device) => !after.devices.some((next) => next.id === device.id));
+          ctx.logger.info(
+            `[DSH PWA] enrolled id=${id} label=${label} devices=${after.devices.length}${evicted === undefined ? '' : ` evicted=${evicted.id}`}`
+          );
           sendJson(res, 200, { id, key, label });
         } catch (err) {
           ctx.logger.warn(`[DSH PWA] device enroll: ${err.message}`);
@@ -428,15 +476,30 @@ ${source}
           const key = typeof body?.key === 'string' ? body.key : '';
           const state = loadDevices(devicesPath);
           const device = findDevice(state, key);
-          if (device === undefined) { sendJson(res, 401, { error: 'unknown device' }); return; }
+          if (device === undefined) {
+            // "The phone is locked out" has two causes that look identical from the
+            // phone: this host holds no record of the key, or it minted a cookie the
+            // fence refuses. The fingerprint (8 characters of the key's hash) joins
+            // this line to the enrollment that handed the key out, so the next
+            // attempt says which record is missing rather than only that one is.
+            ctx.logger.warn(
+              `[DSH PWA] claim refused: key not enrolled (key=${key.length} chars fp=${key === '' ? 'none' : hashKey(key).slice(0, 8)} devices=${state.devices.length})`
+            );
+            sendJson(res, 401, { error: 'unknown device' });
+            return;
+          }
           const authority = requestAuthority(req.headers?.host);
           const secret = loadSecret(credentialsPath);
           if (authority === undefined || secret === undefined) {
+            ctx.logger.warn(
+              `[DSH PWA] claim cannot mint for id=${device.id}: host=${authority ?? 'unknown'} secret=${secret !== undefined}`
+            );
             sendJson(res, 503, { error: 'this host cannot mint a session cookie' });
             return;
           }
           const cookie = mintCookie({ authority, secret, maxAgeDays: DEVICE_COOKIE_MAX_AGE_DAYS });
           saveDevices(devicesPath, touchDevice(state, device.id, Date.now()));
+          ctx.logger.info(`[DSH PWA] claim accepted id=${device.id} fp=${hashKey(key).slice(0, 8)}`);
           res.writeHead(204, { 'Set-Cookie': cookie.header, 'Cache-Control': 'no-store' });
           res.end();
         } catch (err) {
@@ -462,6 +525,7 @@ ${source}
             return;
           }
           saveDevices(devicesPath, next);
+          ctx.logger.info(`[DSH PWA] forgot id=${id} devices=${next.devices.length}`);
           sendJson(res, 200, { removed: state.devices.length - next.devices.length });
         } catch (err) {
           ctx.logger.warn(`[DSH PWA] device forget: ${err.message}`);

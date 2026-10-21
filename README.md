@@ -15,8 +15,28 @@ PWA plugin for [DeepSeek Harness](https://github.com/deepseek-ai/dsh) that adds 
   mid-conversation; a second swipe inside two seconds still leaves, deliberately
 - **Mobile composer fix** — on a phone, Enter inserts a newline instead of sending, and a paste whose payload the composer cannot see is recovered (from the clipboard API, or replayed from the one `insertText` the Android keyboard's clipboard panel sends)
 - **Keyboard stays down** — on a phone the on-screen keyboard only opens for a tap on
-  the text area itself, so **New session** and **Send** stop covering the transcript
-  with it (Android; the reason is under [Limitations](#limitations))
+  the text area itself, so **New session** stops covering the transcript with it
+  (Android; the reason is under [Limitations](#limitations))
+- **Composer above the keyboard** — on a phone the composer rises with the soft keyboard
+  instead of staying in the strip it covers: Chrome 108+ through the viewport meta's
+  `interactive-widget=resizes-content`, iOS Safari and older Chromium through an inlined
+  `visualViewport` script. Desktop layout is unchanged.
+- **A keyboard that stays while you chat** — tapping the transcript, a link, an
+  attachment or any control in the composer card (Send, the model chip, the permission
+  mode, the microphone) leaves the keyboard open, so a press is never lost to the
+  composer moving under it; opening the sidebar, switching view tabs or entering Settings
+  puts it away. A control the browser focuses anyway - the model chip, about 10 ms after a
+  cancelled press - gives the caret straight back to the draft.
+- **Hold Send to queue** — a press held for 300 ms sends through the composer's other
+  busy mode, so a phone set to *Steer* while busy can still queue a message; the queued
+  row keeps its own Steer button. The window closes before the engine's own long press,
+  which on Android opens its selection menu about 400 ms in, takes the focus and drops the
+  touch: a press that loses the page after 150 ms still fires, the menu is held off for a
+  moment afterwards, and the caret goes back to the draft when the engine's long press
+  focuses the button under the finger, so the keyboard stays up. A chord the composer never
+  saw is tried again along a short ladder that outlives the keyboard's composing window,
+  and a pill above the button says what happened (Queued, Steering, Sent, `Sending…` while
+  a retry is still going, or a request to try again).
 - **DSH mark icon set** — the official mark as a white silhouette on dsh's dark
   neutral ground (the `#151517` base and `#f9fafb` label colour the app UI itself
   uses), for the app icon, the favicon and the apple touch icon, with a maskable
@@ -68,6 +88,23 @@ dsh web
 
 Install the app from **Chrome** (⋮ menu → *Install app*, or *Add to Home screen*).
 Samsung Internet cannot host it: it has no flags UI, and the option below needs one.
+
+The composer follows the keyboard. Chrome 108 and later reads
+`interactive-widget=resizes-content` from the host's viewport meta and shrinks the layout
+viewport when the keyboard opens, so the composer rises by itself. Chromium builds
+without that token use the inlined `mobile-keyboard.js`, which boxes the app to the
+visible part of the window. Where the layout viewport already shrank, the script measures
+a gap of 0 and does nothing, so the two paths do not stack.
+
+The keyboard closes when you leave the conversation, not when you tap inside it. Presses
+in `[data-conversation-region]` leave it open — the transcript and its links,
+attachments, and the controls in the composer card, **Send** and the model, permission
+and microphone chips alike; presses outside it, which are the session sidebar, the
+header's view tabs and Settings, put it away. That order matters now that the app's
+height follows the keyboard: a press that dismissed it before the click would move the
+composer down under the finger and the tap would land on whatever slid into its place.
+A press on a control also has to be stopped from taking the caret the way the engine
+does by default, which is what `mobile-composer.js` does while the draft is focused.
 
 The composer fix covers the clipboard panel of an Android keyboard (the panel that
 opens from the clipboard icon above the keys):
@@ -192,6 +229,18 @@ kept. **Forget this device** on the sign-in page drops the key; the host-side re
 can be dropped with `POST /dsh-pwa/device/forget`. If dsh ever changes its cookie
 contract the mint fails closed — the phone is asked for a code, exactly as before.
 
+A device that is refused says why. The sign-in page's diagnosis line carries the
+claim's own result — `the host answered 401 for the key this device sent` means the
+host holds no record of that key, while `the host minted a cookie the fence refused`
+means the mint itself did not satisfy the fence — together with the host, the cookie's
+state and the number of enrolled devices. Those two families of failure look identical
+on a phone and need different fixes. The host logs the same decisions under the
+`[DSH PWA]` prefix: every enrollment (with the id it evicted once the list is full),
+every refused claim (with the key's length, an 8-character fingerprint of its hash and
+the device count), every accepted claim, every forgotten device, and the probe's
+verdict. A fingerprint is not the key and cannot be replayed; neither the cookie value
+nor the signing secret is ever logged.
+
 ## Caching Strategy
 
 | Resource Type | Strategy | Description |
@@ -234,9 +283,18 @@ contract the mint fails closed — the phone is asked for a code, exactly as bef
   crossed-out image item is the first thing to check if that ever regresses.
 - The keyboard mute in the mobile composer fix is Android only. It rides on
   `inputmode="none"` and `virtualkeyboardpolicy="manual"`, which iOS Safari ignores, and
-  the `focus()` wrapper is installed only for a coarse pointer. On an iPhone the
-  keyboard still comes up for **New session** and **Send**; closing it there needs a
-  different lever (a blur instead of a mute), which is not written yet.
+  the `focus()` wrapper is installed only for a coarse pointer. On an iPhone the fallback
+  is a blur under the mute: the keyboard does go away, but the draft loses its caret,
+  where Android hides the keyboard and keeps it.
+- The iOS composer now rises with the keyboard, but that half is untested on a device.
+  Safari ignores `interactive-widget`, so `mobile-keyboard.js` boxes the app to
+  `visualViewport.height` at `visualViewport.offsetTop`; the path has been exercised in
+  Chromium against a simulated visual viewport, not in iOS Safari.
+- Tapping inside the conversation keeps the keyboard open, and that includes **Send**.
+  The keyboard used to be dismissed on that press; now that the composer moves with the
+  keyboard, dismissing it mid-press moved the button away from the finger and made a
+  send take two taps. The cost is that the keyboard stays over part of the transcript
+  after a send until you close it yourself or leave the conversation.
 
 ## Project Structure
 
@@ -247,6 +305,8 @@ dsh-pwa-plugin/
 │   │   └── index.js          # Host plugin (Node.js)
 │   ├── device.js             # Cookie contract + trusted-device store
 │   ├── mobile-composer.js    # The mobile composer fix (inlined into the app HTML)
+│   ├── mobile-keyboard.js    # Boxes the app to the visual viewport while the keyboard is open (inlined)
+│   ├── mobile-queue.js       # Hold the send button to use the other busy mode (inlined)
 │   ├── pwa-client.js         # Swipe-back guard, device enrollment, Android polish (inlined)
 │   └── sw.js                 # Service Worker
 ├── public/
@@ -292,12 +352,34 @@ Zero-dependency suite on Node's built-in runner (`node --test`):
   last typed in, an insertion the editor drops is measured and re-sent exactly once,
   a programmatic focus of a composer the user is not in is muted and then dismissed
   while a focus on the one they are typing in is left alone, a tap on the text area
-  re-arms the keyboard where a tap on any other composer button closes it, and the
-  module ships no diagnostic overlay.
+  re-arms the keyboard, a press in the chat leaves it open and a press on the sidebar or
+  Settings puts it away, a control pressed in the card is cancelled while the draft has
+  the caret where a field in the same card still takes its own press, and the module
+  ships no diagnostic overlay.
+- `test/mobile-queue.test.mjs` — the hold gesture against a fake DOM: a coarse pointer
+  arms only on an enabled primary button with draft text and no trigger menu, a 300 ms
+  hold dispatches one Ctrl+Enter chord at the editor the card holds at that moment and
+  swallows the click behind it, a chord the composer does not cancel is retried once on
+  the same draft and not when the draft moved on, a tap and the ways a press can end early
+  (release, leaving the button, blur, backgrounding) send nothing, a page that goes away
+  once the press is older than 150 ms fires instead of dropping the hold, a cancel with the
+  finger still down keeps the hold while one that reports the finger moved ends it, a
+  cancel after the fire still swallows the release click, the engine's long press menu is
+  kept off a hold that just fired, and the pill reports the mode the chord landed in, says
+  so when it went unanswered, and outlives the release.
+- `test/mobile-keyboard.test.mjs` — the keyboard box against a fake visual viewport in
+  `node:vm`: a closed keyboard leaves the app at `height:100%`, an open one copies the
+  visible height and `offsetTop` into the two variables the rule reads, a `scroll`-only
+  pan is followed, a pinch zoom (both with and without the box) is not treated as a
+  keyboard, a visual viewport taller than the window and a covered strip under 120px are
+  ignored, a burst of events is measured once per frame, closing removes both variables
+  and restores the document scroll once, loading with the keyboard already open measures
+  immediately, and a second copy reuses the first stylesheet.
 - `test/host.test.mjs` — route registration (sw, manifest, 9 icon assets, the
   screenshots prefix, version, auth probe, the three device routes), response headers,
-  the index-HTML script injection, enrollment / claim / forget driven against a
-  temporary home, and the effect cleanup used on HMR unmounts.
+  the index-HTML script injection (including the viewport rewrite and the verbatim
+  inlined composer, keyboard and queue fixes), enrollment / claim / forget driven against
+  a temporary home, and the effect cleanup used on HMR unmounts.
 - `test/device.test.mjs` — the cookie identity pinned against dsh's own derivation, a
   minted cookie accepted by the same contract the fence uses (and rejected for another
   authority, another secret, a tampered payload, a rewritten version or an expired
